@@ -58,6 +58,69 @@ that has access to those contents as well.
 - A Task author can still use the volume "hack" to attach `Workspaces` to `Sidecars` in
 combination with the feature proposed here.
 
+## Proposal
+
+### Add `workspaces` to `Steps`
+
+1. Add a `workspaces` list to `Steps`.
+2. Allow `workspaces` from the `Task` to be explicitly named in that list like this:
+
+    ```yaml
+    workspaces:
+    - name: my-sensitive-workspace
+    steps:
+    - name: foo
+      workspaces:
+      - name: my-sensitive-workspace
+    ```
+3. When a `workspace` is listed in a Step, it is no longer automatically mounted - either to
+`Steps` or `Sidecars` - unless they also have the `workspace` in their own `workspaces` list.
+
+Example YAML:
+
+```yaml
+# task spec
+spec:
+  workspaces:
+  - name: git-ssh-credentials
+    mountPath: /root/.ssh
+  steps:
+  - name: clone-repo
+    image: alpine/git:v2.26.2
+    workspaces:
+    - name: git-ssh-credentials
+    script: |
+      git clone $(params.repo-url) /workspace/source
+  - name: run-unit-tests
+    script: |
+      cd /workspace/source
+      go test ./...
+```
+
+In the above example only the `clone-repo` `Step` will receive access to the `git-ssh-credentials`
+`Workspace`. The `run-unit-tests` `Step` will not receive access to the Workspace volume. Importantly
+this also means that the user-supplied code does not have access to the credential files. Compromising
+the code for the unit tests does not also compromise the SSH credentials.
+
+### Add `workspaces` to `Sidecars`
+
+1. Automatically mount `workspaces` to `Sidecars` just as they're automatically mounted to `Steps` today.
+2. Add a `workspaces` list to `Sidecars`.
+3. Allow `workspaces` from the `Task` to be explicitly named in that list like this:
+
+    ```yaml
+    workspaces:
+    - name: my-workspace
+    sidecars:
+    - name: watch-workspace
+      workspaces:
+      - name: my-workspace
+    ```
+
+4. When a `workspace` is listed in a Sidecar, it is no longer automatically mounted - either to
+`Steps` or `Sidecars` - unless they also have the `workspace` in their own `workspaces` list.
+
+
 ### User Stories
 
 #### Story 1
@@ -102,3 +165,186 @@ to other `Steps` in the same Task performing ancillary work.
 As a Pipeline author I want to be able to quickly audit that the `git-fetch` Task I am using in
 my Pipeline is only exposing the git SSH key for my team's source repo in the single `Step` that
 performs `git clone`, and not to any `Steps` in the same Task performing ancillary work.
+
+## Design Details
+
+Add a new `WorkspaceUsage` struct to the `task_types.go` file:
+
+```go
+// WorkspaceUsage declares that a Step or Sidecar utilizes a Task's Workspace.
+type WorkspaceUsage struct {
+  // Name is the name of the Task's WorkspaceDeclaration that this Step or Sidecar is utilizing. It is required.
+  Name  string `json:"name"`
+}
+```
+
+Update the `Step` struct to include a slice of `WorkspaceUsage`:
+
+```go
+type Step struct {
+  corev1.Container `json:",inline"`
+  Script string `json:"script,omitempty"`
+
+  // Workspaces is a list of workspaces that this Step declares it will use in some way. The presence
+  // of a Workspace in this list prevents other Steps from automatically receiving the Workspace -
+  // they must also explicitly opt-in to receiving it as well in their own workspaces list.
+  Workspaces []WorkspaceUsage `json:"workspaces,omitempty"`
+}
+```
+
+Update the `Sidecar` struct to include a slice of `WorkspaceUsage`:
+
+```go
+// Sidecar embeds the Container type, which allows it to include fields not
+// provided by Container.
+type Sidecar struct {
+  corev1.Container `json:",inline"`
+  Script string `json:"script,omitempty"`
+
+  // Workspaces is a list of workspaces that this Sidecar declares it will use in some way.
+  Workspaces []WorkspaceUsage `json:"workspaces,omitempty"`
+}
+```
+
+## Drawbacks
+
+- If we were to pursue the idea of a shareable `Step` type then we would need to find some way to map from
+the workspaces a Task declares into those that a referenced `Step` declares.
+- It takes the `Step` and `Sidecar` types further from being "pure" k8s Container. However we've already
+made moves in this direction by introducing our own `Script` field to `Steps` and `Sidecars`.
+
+## Alternatives
+
+### Use an explicit volumeMount instead
+
+Instead of adding a `workspaces` list to `Steps`, we could instead lean on the existing
+`volumeMounts` list like this:
+
+```yaml
+# task spec
+spec:
+  workspaces:
+  - name: git-ssh-credentials
+  steps:
+  - name: clone-repo
+    image: alpine/git:v2.26.2
+    volumeMounts:
+    - name: $(workspaces.git-ssh-credentials.volume)
+    script: |
+      git clone $(params.repo-url) /workspace/source
+  - name: run-unit-tests
+    script: |
+      cd /workspace/source
+      go test ./...
+```
+
+And then add a rule that says "if you use a volumeMount to mount a workspace to your Step
+then Tekton will not automatically add volumeMounts to any other Steps." We would also need
+to document this rule.
+
+#### Advantages
+
+Uses an existing Kubernetes container field that the user may already be familiar with.
+
+#### Drawbacks
+
+It's surprising. This approach overloads the meaning of `volumeMounts` with
+additional Tekton-specific context and behaviour (i.e. the additional constraint
+that adding a workspace volume to a `volumeMount` entry will prevent other Steps
+from receiving that `workspace` unless they too include it in their
+`volumeMounts` list).
+
+### Specify complete Workspace declarations in Steps
+
+Allow `Steps` to fully-specify Workspace declarations so that they're not also required
+at the top-level of the Task spec. Here's how that might look:
+
+```yaml
+steps:
+- name: foo
+  workspaces:
+  - name: my-sensitive-workspace
+```
+
+In contrast with the existing proposal:
+
+```yaml
+workspaces:
+- name: my-sensitive-workspace
+steps:
+- name: foo
+  workspaces:
+  - name: my-sensitive-workspace
+```
+
+#### Advantages
+
+- Shorter syntax for isolating `Workspaces` to single `Steps`.
+- Allows for immediate use of fields like `mountPath` as part of the `Workspace` entry in the `Step`.
+
+#### Disadvantages
+
+- What's the behaviour when a `Task` declares a `Workspace` and `Steps` declare a `Workspace` with the
+same name? Possibly the same behaviour as is being proposed by this document? Or a validation error?
+
+- Open question whether a Task author would be able to share a `Workspace` this way across
+multiple `Steps` if they share a common `Workspace` name:
+
+    ```yaml
+    steps:
+    - name: foo
+      workspaces:
+      - name: my-sensitive-workspace
+    - name: bar
+      workspaces:
+      - name: my-sensitive-workspace
+    ```
+
+    Here the `Task` would presumably only expose a single `Workspace` named "my-sensitive-workspace"
+    to be populated by a `TaskRun` / `PipelineRun`?
+
+    Validation might be made more difficult here - if two `Workspaces` in two `Steps` are named
+    almost the same thing the reconciler won't be able to tell if they're "supposed" to be the same or not.
+    Consider the following example:
+
+    ```yaml
+    steps:
+    - name: foo
+      workspaces:
+      - name: my-sensitive-workspace
+    - name: bar
+      workspaces:
+      - name: my-senistive-workspace
+    ```
+
+    Was this a mis-spelling by the `Task` author or intentionally separate `Workspace` declarations?
+
+    One further extension to this idea would be to allow `TaskRuns` or `PipelineRuns` to bind `Workspaces`
+    to specific `Steps` and `Sidecars`:
+
+    ```yaml
+    workspaces:
+    - name: my-workspace
+      emptyDir: {}
+    - name: sensitive-workspace
+      secretRef:
+        name: foo-secret
+    sidecars:
+    - name: do-something-not-secret
+      workspaces:
+      - name: my-workspace
+    steps:
+    - name: do-something-secret
+      workspaces:
+      - name: some-sensitive-workspace
+    ```
+
+## Upgrade & Migration Strategy (optional)
+
+The feature as proposed is entirely backwards-compatible. Omitting the
+`workspaces` field from `Steps` leaves the existing behaviour exactly as
+it works today - all Steps will receive all workspaces.
+
+## References (optional)
+
+- Original design part of the [Credentials UX](https://github.com/tektoncd/pipeline/issues/2343#issuecomment-611155667) issue.
