@@ -1,5 +1,5 @@
 ---
-title: Generic Workspaces
+title: Workspace Volumes
 authors:
   - "@sbwsg"
 creation-date: 2020-12-11
@@ -7,7 +7,7 @@ last-updated: 2020-12-11
 status: proposed
 ---
 
-# TEP-0038: Generic Workspaces
+# TEP-0038: Workspace Volumes
 
 <!-- toc -->
 - [Summary](#summary)
@@ -99,4 +99,64 @@ config as part of the WorkspaceBinding spec.
 ## Requirements
 
 - Must be backwards-compatible with existing Workspaces spec.
+
+## Proposal
+
+1. Add a generic `volumeRef` supported type to Worskpace bindings.
+
+```yaml
+kind: TaskRun
+spec:
+  workspaces:
+  - name: source
+    volumeRef:
+      name: "myvol"
+```
+
+2. In Tekton Pipelines' controller use the `volumeRef` to look up a `volume` entry in the PodTemplate:
+
+```yaml
+kind: TaskRun
+spec:
+  workspaces:
+  - name: git-ssh-credentials
+    volumeRef:
+      name: "myvol"
+  podTemplate:
+    volumes:
+    - name: "myvol"
+      projected:
+        defaultMode: 0400
+        sources:
+        - configMap:
+            name: github-known-hosts  # name of ConfigMap from Auth setup
+        - secret:
+            name: github-private-key  # name of Secret from Auth setup
+```
+
+3. Update the Tekton API Spec to adopt `volumeRef` as a new required volume type.
+
+### Notes/Caveats (optional)
+
+### Risks and Mitigations
+
+### User Experience (optional)
+
+### Performance (optional)
+
+## Design Details](#design-details)
+
+## Test Plan](#test-plan)
+
+## Design Evaluation](#design-evaluation)
+
+## Drawbacks](#drawbacks)
+
+## Alternatives](#alternatives)
+
+## Infrastructure Needed (optional)](#infrastructure-needed-optional)
+
+## Upgrade &amp; Migration Strategy (optional)](#upgrade--migration-strategy-optional)
+
+## References (optional)](#references-optional)
 
